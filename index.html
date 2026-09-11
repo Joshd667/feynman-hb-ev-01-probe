@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HB-EV-01 engine link probe</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 60rem; }
+  input { width: 22rem; font-family: monospace; }
+  pre { background: #f4f4f4; padding: 8px; overflow-x: auto; white-space: pre-wrap; }
+  fieldset { margin-bottom: 12px; }
+  #sentence { font-size: 1.1rem; padding: 8px; border: 2px solid #1e3664; }
+</style>
+</head>
+<body>
+
+<h1>HB-EV-01 engine link probe</h1>
+<p>Measurement instrument for the FeynmanAI HB-EV-01 spike. It holds no key, no
+token, no fixture and no product code. It reads one address from the field
+below and speaks to it. Nothing is stored on any server.</p>
+
+<fieldset>
+  <legend>Engine address</legend>
+  <label for="base">Base URL</label>
+  <input id="base" type="text" value="http://127.0.0.1:11434">
+  <p id="origin"></p>
+</fieldset>
+
+<fieldset>
+  <legend>State</legend>
+  <p id="sentence">Ready.</p>
+</fieldset>
+
+<fieldset>
+  <legend>Last result</legend>
+  <pre id="out">(nothing run yet)</pre>
+</fieldset>
+
+<fieldset>
+  <legend>Run</legend>
+  <p>
+    <button id="b-version" type="button">Health</button>
+    <button id="b-tags" type="button">Catalogue</button>
+    <button id="b-chat" type="button">Streamed chat</button>
+    <button id="b-cancel" type="button">Chat then cancel</button>
+    <button id="b-embed" type="button">Embeddings</button>
+    <button id="b-missing" type="button">Model that does not exist</button>
+    <button id="b-wasm" type="button">WebAssembly</button>
+    <button id="b-storage-write" type="button">Write storage</button>
+    <button id="b-storage-read" type="button">Read storage</button>
+  </p>
+</fieldset>
+
+<script>
+(function () {
+  var CHAT_MODEL = 'gemma3:1b';
+  var EMBED_MODEL = 'nomic-embed-text';
+  var STORAGE_KEY = 'hb-ev-01-marker';
+
+  function el(id) { return document.getElementById(id); }
+  function base() { return el('base').value.replace(/\/+$/, ''); }
+  function say(text) { el('sentence').textContent = text; }
+  function show(value) { el('out').textContent = JSON.stringify(value, null, 2); }
+
+  // Every failure is turned into one of our own sentences here. A provider's
+  // or engine's own text never reaches the screen.
+  function sentence(kind) {
+    if (kind === 'blocked') {
+      return 'Feynman could not reach the AI engine on this computer. The browser ' +
+             'did not allow the connection.';
+    }
+    if (kind === 'unavailable') {
+      return 'The AI engine is not answering on this computer. Check that it is running.';
+    }
+    if (kind === 'refused') {
+      return 'The AI engine refused this website. Its allowed-origins setting does ' +
+             'not name this site.';
+    }
+    if (kind === 'missing-model') {
+      return 'That model is not installed on this computer.';
+    }
+    if (kind === 'cancelled') { return 'Stopped.'; }
+    return 'Something went wrong. Nothing was sent anywhere else.';
+  }
+
+  // A fetch whose failure is classified, never quoted.
+  function call(path, init, tas) {
+    var options = init || {};
+    if (tas) { options.targetAddressSpace = tas; }
+    return fetch(base() + path, options).then(function (response) {
+      return { ok: response.ok, status: response.status, response: response };
+    }, function (error) {
+      // A network-layer refusal (CORS, mixed content, permission, engine down)
+      // is indistinguishable to the page. The name is recorded for the
+      // measurement only; the user sees a sentence.
+      return { ok: false, status: 0, networkError: String(error && error.name) };
+    });
+  }
+
+  var api = {};
+
+  api.version = function (opts) {
+    return call('/api/version', { method: 'GET' }, opts && opts.tas).then(function (r) {
+      if (r.status === 0) { say(sentence('blocked')); return { case: 'version', status: 0, networkError: r.networkError }; }
+      if (r.status === 403) { say(sentence('refused')); return { case: 'version', status: 403 }; }
+      return r.response.json().then(function (body) {
+        say('The AI engine on this computer answered.');
+        return { case: 'version', status: r.status, engineVersionPresent: typeof body.version === 'string' };
+      });
+    });
+  };
+
+  api.tags = function (opts) {
+    return call('/api/tags', { method: 'GET' }, opts && opts.tas).then(function (r) {
+      if (r.status === 0) { say(sentence('blocked')); return { case: 'tags', status: 0, networkError: r.networkError }; }
+      if (r.status === 403) { say(sentence('refused')); return { case: 'tags', status: 403 }; }
+      return r.response.json().then(function (body) {
+        var names = (body.models || []).map(function (m) { return m.name; });
+        say('The AI engine listed ' + names.length + ' model(s).');
+        return { case: 'tags', status: r.status, count: names.length, names: names };
+      });
+    });
+  };
+
+  // Streamed chat. Counts NDJSON lines and reports the final done object's
+  // shape, never its text.
+  function stream(opts) {
+    var options = opts || {};
+    var controller = new AbortController();
+    var cancelAfter = options.cancelAfter || 0;
+    var started = Date.now();
+    var body = {
+      model: options.model || CHAT_MODEL,
+      messages: [{ role: 'user', content: options.prompt || 'Count slowly from one to forty.' }],
+      stream: true
+    };
+    return call('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    }, options.tas).then(function (r) {
+      if (r.status === 0) { say(sentence('blocked')); return { case: 'chat', status: 0, networkError: r.networkError }; }
+      if (r.status === 403) { say(sentence('refused')); return { case: 'chat', status: 403 }; }
+      if (r.status === 404) { say(sentence('missing-model')); return { case: 'chat', status: 404 }; }
+      var reader = r.response.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = '';
+      var chunks = 0;
+      var characters = 0;
+      var done = null;
+      var cancelled = false;
+      say('The AI engine is answering.');
+      function pump() {
+        return reader.read().then(function (step) {
+          if (step.done) { return; }
+          buffer += decoder.decode(step.value, { stream: true });
+          var lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (!line) { continue; }
+            var parsed;
+            try { parsed = JSON.parse(line); } catch (e) { continue; }
+            chunks += 1;
+            if (parsed.message && typeof parsed.message.content === 'string') {
+              characters += parsed.message.content.length;
+            }
+            if (parsed.done === true) {
+              done = {
+                done: true,
+                doneReason: parsed.done_reason || null,
+                hasEvalCount: typeof parsed.eval_count === 'number',
+                hasTotalDuration: typeof parsed.total_duration === 'number'
+              };
+            }
+          }
+          if (cancelAfter && chunks >= cancelAfter && !cancelled) {
+            cancelled = true;
+            controller.abort();
+            return;
+          }
+          return pump();
+        }, function (error) {
+          if (String(error && error.name) === 'AbortError') { cancelled = true; return; }
+          // The stream broke part-way. The engine may have stopped.
+          done = done || { done: false, broke: true };
+          return;
+        });
+      }
+      return pump().then(function () {
+        if (cancelled) { say(sentence('cancelled')); }
+        else if (!done) { say(sentence('unavailable')); }
+        else { say('The AI engine finished answering.'); }
+        return {
+          case: 'chat',
+          status: r.status,
+          chunks: chunks,
+          characters: characters,
+          done: done,
+          cancelled: cancelled,
+          elapsedMs: Date.now() - started
+        };
+      });
+    });
+  }
+
+  api.chat = function (opts) { return stream(opts); };
+  api.chatCancel = function (opts) {
+    var options = opts || {};
+    options.cancelAfter = options.cancelAfter || 5;
+    return stream(options);
+  };
+  api.missingModel = function () {
+    return stream({ model: 'hb-ev-01-model-that-does-not-exist', prompt: 'hello' });
+  };
+
+  // /api/ps, read after a cancel to see whether the model stayed loaded.
+  api.ps = function () {
+    return call('/api/ps', { method: 'GET' }).then(function (r) {
+      if (r.status !== 200) { return { case: 'ps', status: r.status, networkError: r.networkError }; }
+      return r.response.json().then(function (body) {
+        return {
+          case: 'ps',
+          status: 200,
+          running: (body.models || []).map(function (m) {
+            return { name: m.name, expiresAt: m.expires_at || null };
+          })
+        };
+      });
+    });
+  };
+
+  api.embed = function (opts) {
+    return call('/api/embed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: EMBED_MODEL, input: 'Feynman spike measurement sentence.' })
+    }, opts && opts.tas).then(function (r) {
+      if (r.status === 0) { say(sentence('blocked')); return { case: 'embed', status: 0, networkError: r.networkError }; }
+      if (r.status === 403) { say(sentence('refused')); return { case: 'embed', status: 403 }; }
+      if (r.status === 404) { say(sentence('missing-model')); return { case: 'embed', status: 404 }; }
+      return r.response.json().then(function (body) {
+        var vectors = body.embeddings || [];
+        var dimensions = vectors.length ? vectors[0].length : 0;
+        say('The AI engine returned an embedding of ' + dimensions + ' values.');
+        return { case: 'embed', status: r.status, vectors: vectors.length, dimensions: dimensions };
+      });
+    });
+  };
+
+  // A trivial module: (module (func (export "answer") (result i32) i32.const 42))
+  api.wasm = function () {
+    var bytes = new Uint8Array([
+      0, 97, 115, 109, 1, 0, 0, 0,
+      1, 5, 1, 96, 0, 1, 127,
+      3, 2, 1, 0,
+      7, 10, 1, 6, 97, 110, 115, 119, 101, 114, 0, 0,
+      10, 6, 1, 4, 0, 65, 42, 11
+    ]);
+    return WebAssembly.instantiate(bytes).then(function (result) {
+      var answer = result.instance.exports.answer();
+      say('WebAssembly ran and returned ' + answer + '.');
+      return { case: 'wasm', instantiated: true, answer: answer };
+    }, function (error) {
+      say('WebAssembly did not run in this browser configuration.');
+      return { case: 'wasm', instantiated: false, errorName: String(error && error.name) };
+    });
+  };
+
+  // Storage. IndexedDB and OPFS on this origin.
+  function idbWrite(value) {
+    return new Promise(function (resolve) {
+      var open = indexedDB.open('hb-ev-01', 1);
+      open.onupgradeneeded = function () { open.result.createObjectStore('marks'); };
+      open.onerror = function () { resolve({ ok: false, reason: 'open-failed' }); };
+      open.onsuccess = function () {
+        var db = open.result;
+        var tx = db.transaction('marks', 'readwrite');
+        tx.objectStore('marks').put(value, STORAGE_KEY);
+        tx.oncomplete = function () { db.close(); resolve({ ok: true }); };
+        tx.onerror = function () { db.close(); resolve({ ok: false, reason: 'write-failed' }); };
+      };
+    });
+  }
+  function idbRead() {
+    return new Promise(function (resolve) {
+      var open = indexedDB.open('hb-ev-01', 1);
+      open.onupgradeneeded = function () { open.result.createObjectStore('marks'); };
+      open.onerror = function () { resolve({ present: false, reason: 'open-failed' }); };
+      open.onsuccess = function () {
+        var db = open.result;
+        var tx = db.transaction('marks', 'readonly');
+        var get = tx.objectStore('marks').get(STORAGE_KEY);
+        get.onsuccess = function () { db.close(); resolve({ present: get.result !== undefined, value: get.result || null }); };
+        get.onerror = function () { db.close(); resolve({ present: false, reason: 'read-failed' }); };
+      };
+    });
+  }
+  function opfsWrite(value) {
+    if (!navigator.storage || !navigator.storage.getDirectory) {
+      return Promise.resolve({ ok: false, reason: 'no-opfs' });
+    }
+    return navigator.storage.getDirectory().then(function (dir) {
+      return dir.getFileHandle('hb-ev-01.txt', { create: true });
+    }).then(function (handle) {
+      return handle.createWritable();
+    }).then(function (writable) {
+      return writable.write(value).then(function () { return writable.close(); });
+    }).then(function () {
+      return { ok: true };
+    }, function (error) {
+      return { ok: false, reason: String(error && error.name) };
+    });
+  }
+  function opfsRead() {
+    if (!navigator.storage || !navigator.storage.getDirectory) {
+      return Promise.resolve({ present: false, reason: 'no-opfs' });
+    }
+    return navigator.storage.getDirectory().then(function (dir) {
+      return dir.getFileHandle('hb-ev-01.txt', { create: false });
+    }).then(function (handle) {
+      return handle.getFile();
+    }).then(function (file) {
+      return file.text();
+    }).then(function (text) {
+      return { present: true, value: text };
+    }, function (error) {
+      return { present: false, reason: String(error && error.name) };
+    });
+  }
+  function extensionStorageWrite(value) {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+      return Promise.resolve({ ok: false, reason: 'not-an-extension' });
+    }
+    return chrome.storage.local.set({ 'hb-ev-01-marker': value }).then(function () {
+      return { ok: true };
+    }, function () { return { ok: false, reason: 'write-failed' }; });
+  }
+  function extensionStorageRead() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+      return Promise.resolve({ present: false, reason: 'not-an-extension' });
+    }
+    return chrome.storage.local.get('hb-ev-01-marker').then(function (bag) {
+      var value = bag['hb-ev-01-marker'];
+      return { present: value !== undefined, value: value || null };
+    }, function () { return { present: false, reason: 'read-failed' }; });
+  }
+
+  api.storageWrite = function (opts) {
+    var value = (opts && opts.value) || ('written-' + Date.now());
+    return Promise.all([idbWrite(value), opfsWrite(value), extensionStorageWrite(value)])
+      .then(function (results) {
+        say('Storage written.');
+        return { case: 'storage-write', value: value, indexedDb: results[0], opfs: results[1], extension: results[2] };
+      });
+  };
+  api.storageRead = function () {
+    return Promise.all([idbRead(), opfsRead(), extensionStorageRead()]).then(function (results) {
+      say('Storage read.');
+      return { case: 'storage-read', indexedDb: results[0], opfs: results[1], extension: results[2] };
+    });
+  };
+
+  api.persisted = function () {
+    if (!navigator.storage || !navigator.storage.persisted) {
+      return Promise.resolve({ case: 'persisted', supported: false });
+    }
+    return navigator.storage.persisted().then(function (value) {
+      return { case: 'persisted', supported: true, persisted: value };
+    });
+  };
+
+  window.probe = {
+    base: base,
+    setBase: function (value) { el('base').value = value; return value; },
+    run: function (name, opts) {
+      if (!api[name]) { return Promise.resolve({ error: 'no such case: ' + name }); }
+      return api[name](opts).then(function (result) {
+        window.probe.last = result;
+        show(result);
+        return result;
+      }, function (error) {
+        var failure = { case: name, threw: String(error && error.name) };
+        window.probe.last = failure;
+        show(failure);
+        say(sentence('other'));
+        return failure;
+      });
+    },
+    last: null
+  };
+
+  el('origin').textContent = 'This page is served from ' + window.location.origin + '.';
+  el('b-version').onclick = function () { window.probe.run('version'); };
+  el('b-tags').onclick = function () { window.probe.run('tags'); };
+  el('b-chat').onclick = function () { window.probe.run('chat'); };
+  el('b-cancel').onclick = function () { window.probe.run('chatCancel'); };
+  el('b-embed').onclick = function () { window.probe.run('embed'); };
+  el('b-missing').onclick = function () { window.probe.run('missingModel'); };
+  el('b-wasm').onclick = function () { window.probe.run('wasm'); };
+  el('b-storage-write').onclick = function () { window.probe.run('storageWrite'); };
+  el('b-storage-read').onclick = function () { window.probe.run('storageRead'); };
+}());
+</script>
+
+</body>
+</html>
